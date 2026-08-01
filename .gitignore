@@ -1,0 +1,16 @@
+# Virtual environments
+venv/
+.venv/
+backend/venv/
+backend/.venv/
+__pycache__/
+
+# Dependencies & Builds
+node_modules/
+.next/
+dist/
+build/
+
+# Environment variables
+.env
+.env.local
