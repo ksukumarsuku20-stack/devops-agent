@@ -1,0 +1,21 @@
+name: CI Build Check
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Build & Tests
+        run: |
+          echo "Starting automated unit tests..."
+          echo "ERROR: ModuleNotFoundError: No module named 'fictional_dep'"
+          echo "AssertionError: Expected status code 200, got 500"
+          exit 1
