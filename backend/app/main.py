@@ -1,116 +1,76 @@
-import hashlib
-import hmac
 import os
-import re
-from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Request
+from datetime import date
+from fastapi import FastAPI, Request, HTTPException
+from supabase import create_client, Client
 
-from app.agent import generate_code_fix
-from app.github_service import (
-    create_fix_pull_request,
-    get_file_content,
-    get_workflow_run_logs,
-)
+app = FastAPI()
 
-load_dotenv()
+# Supabase Admin Client
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
-app = FastAPI(title="DevOps Agent Backend")
+def check_and_increment_usage(installation_id: int, owner_login: str) -> bool:
+    if not supabase:
+        return True
 
-WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
-
-
-def parse_ai_response(response_text: str):
-    """Helper function to split explanation and fixed code from Gemini output."""
-    explanation, fixed_code = "", ""
-
-    if "---EXPLANATION---" in response_text:
-        parts = response_text.split("---FIXED_CODE---")
-        explanation = (
-            parts[0].replace("---EXPLANATION---", "").strip()
-            if len(parts) > 0
-            else ""
-        )
-        fixed_code = parts[1].strip() if len(parts) > 1 else ""
-    else:
-        explanation = "Automated bug fix applied by Gemini AI."
-        fixed_code = response_text
-
-    # Clean markdown block markers if present
-    fixed_code = re.sub(r"^```[a-zA-Z]*\n", "", fixed_code)
-    fixed_code = re.sub(r"\n```$", "", fixed_code)
-
-    return explanation, fixed_code
-
+    today = date.today()
+    response = supabase.table("usage_tracker").select("*").eq("github_installation_id", installation_id).execute()
+    data = response.data
+    
+    if not data:
+        supabase.table("usage_tracker").insert({
+            "github_installation_id": installation_id,
+            "owner_login": owner_login,
+            "monthly_quota": 5,
+            "used_this_month": 1,
+            "last_reset_date": str(today)
+        }).execute()
+        return True
+    
+    record = data[0]
+    last_reset = date.fromisoformat(record["last_reset_date"])
+    
+    if today.month != last_reset.month or today.year != last_reset.year:
+        supabase.table("usage_tracker").update({
+            "used_this_month": 1,
+            "last_reset_date": str(today)
+        }).eq("github_installation_id", installation_id).execute()
+        return True
+    
+    if record["used_this_month"] >= record["monthly_quota"]:
+        print(f"⚠️ Quota Limit Reached for installation {installation_id}")
+        return False
+        
+    supabase.table("usage_tracker").update({
+        "used_this_month": record["used_this_month"] + 1
+    }).eq("github_installation_id", installation_id).execute()
+    
+    return True
 
 @app.get("/")
-def read_root():
-    return {"message": "DevOps Agent Backend is running!"}
-
+def home():
+    return {"message": "DevOps AI Agent Service is Live"}
 
 @app.post("/webhook/github")
-async def github_webhook(
-    request: Request,
-    x_github_event: str = Header(None),
-    x_hub_signature_256: str = Header(None),
-):
-    payload_body = await request.body()
-
-    # HMAC Verification
-    if x_hub_signature_256 and WEBHOOK_SECRET:
-        hash_object = hmac.new(
-            WEBHOOK_SECRET.encode("utf-8"),
-            msg=payload_body,
-            digestmod=hashlib.sha256,
-        )
-        expected_signature = "sha256=" + hash_object.hexdigest()
-        if not hmac.compare_digest(expected_signature, x_hub_signature_256):
-            raise HTTPException(
-                status_code=400, detail="Invalid HMAC signature"
-            )
-
+async def github_webhook(request: Request):
     payload = await request.json()
-    print(f"Received GitHub Event: {x_github_event}")
+    event_type = request.headers.get("X-GitHub-Event")
 
-    # Process Workflow Failures (CI/CD)
-    if x_github_event == "workflow_run":
-        workflow = payload.get("workflow_run", {})
-        conclusion = workflow.get("conclusion")
-        installation_id = payload.get("installation", {}).get("id")
+    if event_type == "workflow_run":
+        action = payload.get("action")
+        workflow_run = payload.get("workflow_run", {})
+        conclusion = workflow_run.get("conclusion")
 
-        if conclusion == "failure" and installation_id:
-            repo_full_name = payload.get("repository", {}).get("full_name")
-            head_branch = workflow.get("head_branch", "main")
-            run_id = workflow.get("id")
+        if action == "completed" and conclusion == "failure":
+            installation_id = payload.get("installation", {}).get("id")
+            owner_login = payload.get("repository", {}).get("owner", {}).get("login")
 
-            print(f"❌ CI Failure detected on {repo_full_name} (Run ID: {run_id})")
+            if installation_id and owner_login:
+                if not check_and_increment_usage(installation_id, owner_login):
+                    return {"status": "ignored", "reason": "Monthly quota limit reached"}
 
-            # Fetch real terminal logs
-            real_logs = get_workflow_run_logs(repo_full_name, run_id, installation_id)
-            if not real_logs:
-                real_logs = f"Workflow '{workflow.get('name')}' failed on branch '{head_branch}'"
+            # Process failure with Gemini AI & GitHub API
+            print("Processing failure with Gemini AI...")
 
-            # Fetch code file context
-            target_file = "README.md"
-            real_code = get_file_content(
-                repo_full_name, target_file, ref=head_branch, installation_id=installation_id
-            )
-
-            # Generate fix via Gemini AI
-            ai_result = generate_code_fix(
-                file_path=target_file,
-                code_snippet=real_code,
-                error_log=real_logs,
-            )
-
-            if ai_result.get("status") == "success":
-                explanation, fixed_code = parse_ai_response(ai_result["ai_response"])
-                pr_url = create_fix_pull_request(
-                    repo_full_name=repo_full_name,
-                    file_path=target_file,
-                    fixed_code=fixed_code,
-                    explanation=explanation,
-                    installation_id=installation_id,
-                )
-                return {"status": "fix_submitted", "pr_url": pr_url}
-
-    return {"status": "success", "event_processed": x_github_event}
+    return {"status": "ok"}
