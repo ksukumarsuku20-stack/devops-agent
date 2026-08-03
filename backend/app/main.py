@@ -35,7 +35,7 @@ def parse_ai_response(response_text: str):
         explanation = "Automated bug fix applied by Gemini AI."
         fixed_code = response_text
 
-    # Clean markdown code blocks if present
+    # Clean markdown block markers if present
     fixed_code = re.sub(r"^```[a-zA-Z]*\n", "", fixed_code)
     fixed_code = re.sub(r"\n```$", "", fixed_code)
 
@@ -77,48 +77,33 @@ async def github_webhook(
         conclusion = workflow.get("conclusion")
         installation_id = payload.get("installation", {}).get("id")
 
-        if conclusion == "failure":
-            print("❌ CI/CD Build Failed! Agent initiating fix sequence...")
-
+        if conclusion == "failure" and installation_id:
             repo_full_name = payload.get("repository", {}).get("full_name")
             head_branch = workflow.get("head_branch", "main")
             run_id = workflow.get("id")
-            target_file = "README.md"  # Target file to inspect/fix
 
-            # 1. Fetch real build logs from GitHub Actions
-            real_logs = get_workflow_run_logs(
-                repo_full_name, run_id, installation_id=installation_id
-            )
+            print(f"❌ CI Failure detected on {repo_full_name} (Run ID: {run_id})")
+
+            # Fetch real terminal logs
+            real_logs = get_workflow_run_logs(repo_full_name, run_id, installation_id)
             if not real_logs:
                 real_logs = f"Workflow '{workflow.get('name')}' failed on branch '{head_branch}'"
 
-            # 2. Fetch real file content from GitHub
+            # Fetch code file context
+            target_file = "README.md"
             real_code = get_file_content(
-                repo_full_name,
-                target_file,
-                ref=head_branch,
-                installation_id=installation_id,
+                repo_full_name, target_file, ref=head_branch, installation_id=installation_id
             )
-            if not real_code:
-                real_code = "# Default fallback code file"
 
-            # 3. Ask Gemini for Fix using real code and terminal failure logs
+            # Generate fix via Gemini AI
             ai_result = generate_code_fix(
                 file_path=target_file,
                 code_snippet=real_code,
                 error_log=real_logs,
             )
 
-            print("\n------------------ 🤖 GEMINI AI RESULT ------------------")
-            print(ai_result)
-            print("---------------------------------------------------------\n")
-
             if ai_result.get("status") == "success":
-                explanation, fixed_code = parse_ai_response(
-                    ai_result["ai_response"]
-                )
-
-                # 4. Open PR on GitHub
+                explanation, fixed_code = parse_ai_response(ai_result["ai_response"])
                 pr_url = create_fix_pull_request(
                     repo_full_name=repo_full_name,
                     file_path=target_file,
@@ -126,11 +111,6 @@ async def github_webhook(
                     explanation=explanation,
                     installation_id=installation_id,
                 )
-                print(f"🔗 PR Status / URL: {pr_url}")
-                return {
-                    "status": "fix_submitted",
-                    "pr_url": pr_url,
-                    "explanation": explanation,
-                }
+                return {"status": "fix_submitted", "pr_url": pr_url}
 
     return {"status": "success", "event_processed": x_github_event}
